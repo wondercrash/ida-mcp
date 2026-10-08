@@ -14,8 +14,9 @@
   "repository": "https://github.com/HexRaysSA/ida-mcp.git",
   "files": [
     "ida-mcp.ts",
-    "ida-mcp-environment.ts",
+    "ida-mcp-environment.mjs",
     "ida-mcp-transport.ts",
+    "ida-mcp-preparation.mjs",
     "ida-plugin.json",
     "ida_mcp_plugin.py",
     "ida_mcp/*.py",
@@ -59,6 +60,6 @@
   "scripts": {
     "test": "node --test ida-mcp.test.ts ida-mcp-environment.test.ts ida-mcp-transport.test.ts",
     "test:integration": "node --test ida-mcp-environment.integration.test.ts",
-    "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck ida-mcp.ts ida-mcp-environment.ts ida-mcp-transport.ts ida-mcp.test.ts ida-mcp-environment.test.ts ida-mcp-environment.integration.test.ts ida-mcp-transport.test.ts"
+    "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --allowJs --checkJs --allowImportingTsExtensions --skipLibCheck ida-mcp.ts ida-mcp-environment.mjs ida-mcp-preparation.mjs ida-mcp-transport.ts ida-mcp.test.ts ida-mcp-environment.test.ts ida-mcp-environment.integration.test.ts ida-mcp-transport.test.ts"
   }
 }

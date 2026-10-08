@@ -19,7 +19,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
-import { preparePythonEnvironment } from "./ida-mcp-environment.ts";
+import { preparePythonEnvironment } from "./ida-mcp-environment.mjs";
 import { EofStdioClientTransport } from "./ida-mcp-transport.ts";
 
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url));
@@ -499,10 +499,14 @@ export default function idaMcp(pi: ExtensionAPI) {
 		// grace period, inside the host's 2s shutdown budget. The server saves
 		// and exits on its own; it is never killed. Closing a client still
 		// preparing its environment aborts the launch.
-		await Promise.all(
-			[active, connecting !== active ? connecting : undefined].map(c =>
-				c?.close().catch(() => undefined),
-			),
-		);
+		try {
+			await Promise.all(
+				[active, connecting !== active ? connecting : undefined].map(c => c?.close()),
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`IDA MCP shutdown: ${message}`, "error");
+			throw error;
+		}
 	});
 }

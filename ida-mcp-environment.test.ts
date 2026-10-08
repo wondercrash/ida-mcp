@@ -15,7 +15,7 @@ import test from "node:test";
 import {
   environmentKey,
   preparePythonEnvironment,
-} from "./ida-mcp-environment.ts";
+} from "./ida-mcp-environment.mjs";
 
 async function packageRoot(
   t: test.TestContext,

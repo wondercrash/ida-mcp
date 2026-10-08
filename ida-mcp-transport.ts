@@ -112,9 +112,12 @@ export class EofStdioClientTransport implements Transport {
     if (this.#closing) return;
     this.#closing = true;
     this.#abort.abort();
-    // An unpublished preparation owns its own build tree and cache cleanup.
-    // Do not abandon it when the host shuts down.
-    await this.#preparation?.catch(() => undefined);
+    // Await cancellation or an acknowledged independent cleanup owner. Report
+    // an OS termination denial without disguising it as ordinary EOF/abort.
+    let preparationError: unknown;
+    await this.#preparation?.catch((error: unknown) => {
+      if (!(error instanceof Error && error.name === "AbortError")) preparationError = error;
+    });
 
     const child = this.#child;
     if (child) {
@@ -139,6 +142,7 @@ export class EofStdioClientTransport implements Transport {
     }
     this.#readBuffer.clear();
     this.#notifyClosed();
+    if (preparationError !== undefined) throw preparationError;
   }
 
   #processReadBuffer(): void {

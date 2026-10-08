@@ -98,6 +98,13 @@ select a new environment instead of replacing files held by another session.
 Concurrent first starts share preparation. The server runs directly through
 Python, without `uv` or the `ida-mcp.exe` launcher in its runtime process tree.
 
+Cold preparation runs in a separate owner process; warm starts spawn no
+preparation worker. Cancelling startup terminates only unpublished dependency
+builds, never running MCP servers or Nexus workers. If termination fails,
+shutdown reports the original error and the preparation owner PID. That owner
+retains its lock until the build exits, then removes its unpublished files;
+it can outlive the host, and a hung build delays this cleanup.
+
 Environments live under `%LOCALAPPDATA%/ida-mcp/envs` on Windows,
 `~/Library/Caches/ida-mcp/envs` on macOS, and
 `${XDG_CACHE_HOME:-~/.cache}/ida-mcp/envs` on Linux. Old environments are retained

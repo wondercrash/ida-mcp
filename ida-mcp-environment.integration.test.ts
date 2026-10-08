@@ -16,17 +16,58 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { delimiter, dirname, join, relative } from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   environmentKey,
   preparePythonEnvironment,
-} from "./ida-mcp-environment.ts";
+} from "./ida-mcp-environment.mjs";
 
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url));
+
+async function packedPackage(base: string): Promise<string> {
+  // npm supplies the actual CLI path to its test script on every platform.
+  const npmCli = process.env.npm_execpath;
+  assert.ok(npmCli, "run the package integration tests via npm run test:integration");
+  const { stdout } = await promisify(execFile)(process.execPath, [npmCli, "pack", "--json", "--ignore-scripts", "--pack-destination", base], { cwd: PACKAGE_ROOT });
+  const output: unknown = JSON.parse(stdout);
+  assert.ok(Array.isArray(output) && output[0] && typeof output[0].filename === "string");
+  const root = join(base, "node_modules", "ida-mcp");
+  await mkdir(root, { recursive: true });
+  await promisify(execFile)("tar", ["-xzf", join(base, output[0].filename), "-C", root, "--strip-components=1"]);
+  return root;
+}
+
+for (const runtime of ["node", "bun"] as const) {
+  test(`${runtime} npm-installed package prepares cold and reuses warm environment`, { timeout: 120_000 }, async (t) => {
+    const command = runtime === "node" ? process.execPath : "bun";
+    if (runtime === "bun" && spawnSync(command, ["--version"]).error?.message.includes("ENOENT")) {
+      t.skip("Bun is not installed");
+      return;
+    }
+    const base = await mkdtemp(join(tmpdir(), "ida-mcp-packed-cold-it-"));
+    t.after(() => rm(base, { recursive: true, force: true }));
+    const root = await packedPackage(base);
+    const environmentUrl = pathToFileURL(join(root, "ida-mcp-environment.mjs")).href;
+    const cacheRoot = join(base, "cache");
+    const code = `
+import assert from "node:assert/strict";
+import { preparePythonEnvironment } from ${JSON.stringify(environmentUrl)};
+const first = await preparePythonEnvironment(${JSON.stringify(root)}, { cacheRoot: ${JSON.stringify(cacheRoot)} });
+const second = await preparePythonEnvironment(${JSON.stringify(root)}, { cacheRoot: ${JSON.stringify(cacheRoot)} });
+assert.equal(first.prepared, true);
+assert.equal(second.prepared, false);
+assert.equal(first.python, second.python);
+console.log("packed cold/warm PASS");
+`;
+    const { stdout } = await promisify(execFile)(command, ["--input-type=module", "-e", code], { env: { ...process.env, BUN_BE_BUN: "1" } });
+    assert.equal(stdout.trim(), "packed cold/warm PASS");
+  });
+}
 
 async function copyPackage(t: test.TestContext): Promise<{
   base: string;
@@ -188,7 +229,8 @@ test(
 );
 
 for (const runtime of ["node", "bun"] as const) {
-test(`${runtime} aborted host owns and cleans up its unpublished uv build`, { timeout: 60_000 }, async (t) => {
+for (const denied of [false, true]) {
+test(`${runtime} aborted host ${denied ? "hands off after termination denial" : "cleans up its unpublished uv build"}`, { timeout: 60_000 }, async (t) => {
   const hostCommand = runtime === "node" ? process.execPath : "bun";
   if (runtime === "bun") {
     const available = spawnSync(hostCommand, ["--version"], { encoding: "utf8" });
@@ -198,11 +240,26 @@ test(`${runtime} aborted host owns and cleans up its unpublished uv build`, { ti
     }
     assert.equal(available.status, 0, available.stderr || available.error?.message);
   }
+  if (denied && process.platform !== "win32") {
+    t.skip("taskkill denial exercises the Windows termination path");
+    return;
+  }
   const base = await mkdtemp(join(tmpdir(), "ida-mcp-aborted-build-it-"));
   t.after(() => rm(base, { recursive: true, force: true }));
-  const root = join(base, "pkg");
+  const root = await packedPackage(base);
+  const pathKey = Object.keys(process.env).find(key => key.toUpperCase() === "PATH") ?? "PATH";
+  let childEnv = { ...process.env };
+  if (denied) {
+    // Execute a real failing taskkill replacement. The uv/build/owner
+    // processes remain real and run independently of the host process.
+    const shim = join(base, "denied-taskkill");
+    await mkdir(shim);
+    await copyFile(process.execPath, join(shim, "taskkill.exe"));
+    const preload = join(base, "deny-taskkill.mjs");
+    await writeFile(preload, `if (/taskkill[.]exe$/i.test(process.execPath)) { process.stderr.write("injected termination denied\\n"); process.exit(1); }`);
+    childEnv = { ...childEnv, [pathKey]: `${shim}${delimiter}${process.env[pathKey]}`, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import=${pathToFileURL(preload).href}` };
+  }
   const cacheRoot = join(base, "cache");
-  await mkdir(root);
   await writeFile(join(root, "pyproject.toml"), `[project]
 name = "abort-fixture"
 version = "1.0.0"
@@ -229,12 +286,12 @@ def prepare_metadata_for_build_editable(metadata_directory, config_settings=None
     return DIST
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
     if os.environ.get("ABORT_BUILD_MARKER"):
-        descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
         marker = pathlib.Path(os.environ["ABORT_BUILD_MARKER"])
         temp = marker.with_suffix(".pending")
         temp.write_text(str(os.getpid()) + " " + str(descendant.pid))
         os.replace(temp, marker)
-        time.sleep(8)
+        time.sleep(3)
     filename = "abort_fixture-1.0.0-py3-none-any.whl"
     with zipfile.ZipFile(pathlib.Path(wheel_directory) / filename, "w") as wheel:
         wheel.writestr(DIST + "/METADATA", META)
@@ -255,9 +312,10 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
     throw new Error("build watcher closed without a marker");
   })();
   const transportUrl = pathToFileURL(join(PACKAGE_ROOT, "ida-mcp-transport.ts")).href;
-  const environmentUrl = pathToFileURL(join(PACKAGE_ROOT, "ida-mcp-environment.ts")).href;
+  const environmentUrl = pathToFileURL(join(root, "ida-mcp-environment.mjs")).href;
   const hostCode = `
 import { once } from "node:events";
+import assert from "node:assert/strict";
 import { EofStdioClientTransport } from ${JSON.stringify(transportUrl)};
 import { preparePythonEnvironment } from ${JSON.stringify(environmentUrl)};
 const transport = new EofStdioClientTransport(async signal => {
@@ -265,18 +323,26 @@ const transport = new EofStdioClientTransport(async signal => {
   return { command: process.execPath, args: ["-e", "require('node:fs').writeFileSync(process.env.SERVER_MARKER, 'launched')"], cwd: process.env.FIXTURE_ROOT, env: process.env };
 });
 const started = transport.start().catch(error => {
-  if (error.name !== "AbortError") throw error;
+  if (error.name !== "AbortError" && process.env.DENY_TERMINATION !== "1") throw error;
 });
 process.stdin.resume();
 await once(process.stdin, "end");
-await transport.close();
+if (process.env.DENY_TERMINATION === "1") {
+  try { await transport.close(); assert.fail("termination denial must reject close"); }
+  catch (error) {
+    assert.match(error.message, /injected termination denied/);
+    console.log(error.message);
+  }
+} else await transport.close();
 await started;
 `;
   const host = spawn(hostCommand, ["--input-type=module", "-e", hostCode], {
-    env: { ...process.env, UV_OFFLINE: "1", ABORT_BUILD_MARKER: startedFile, SERVER_MARKER: launchedFile, FIXTURE_ROOT: root, FIXTURE_CACHE: cacheRoot },
-    stdio: ["pipe", "ignore", "pipe"],
+    env: { ...childEnv, UV_OFFLINE: "1", ABORT_BUILD_MARKER: startedFile, SERVER_MARKER: launchedFile, FIXTURE_ROOT: root, FIXTURE_CACHE: cacheRoot, DENY_TERMINATION: denied ? "1" : "0" },
+    stdio: ["pipe", "pipe", "pipe"],
   });
   let stderr = "";
+  let stdout = "";
+  host.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
   host.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
   const exited = once(host, "exit");
   const pids = (await Promise.race([
@@ -289,13 +355,34 @@ await started;
   assert.equal(exitCode, 0, stderr);
   assert.ok(Date.now() - shutdownAt < 2000, "preparation cancellation must fit the host shutdown budget");
   assert.equal(existsSync(launchedFile), false, "aborting preparation must not launch a server");
+  if (denied) {
+    process.kill(pids[0], 0);
+    const entries = await readdir(cacheRoot, { withFileTypes: true });
+    assert.equal(entries.filter(entry => entry.isDirectory()).length, 1, "live writer's staging must stay intact");
+    assert.equal(entries.some(entry => entry.name.endsWith(".ready")), false, "aborted build must never publish");
+    const ownerPid = Number(/cleanup owner (\d+)/.exec(stdout)?.[1]);
+    assert.ok(ownerPid > 0, stdout);
+    process.kill(ownerPid, 0);
+    const deadline = Date.now() + 15_000;
+    for (;;) {
+      let ownerAlive = true;
+      try { process.kill(ownerPid, 0); } catch { ownerAlive = false; }
+      if (!ownerAlive && (await readdir(cacheRoot)).length === 0) break;
+      assert.ok(Date.now() < deadline, "cleanup owner must eventually discard the finished build and exit");
+      // Cross-process termination and cleanup are real integration effects.
+      await delay(25);
+    }
+  }
   for (const pid of pids) {
     assert.throws(() => process.kill(pid, 0), `preparation process ${pid} is still alive`);
   }
   assert.deepEqual(await readdir(cacheRoot), [], "aborted preparation must remove its environment, log and lock");
   const retryAt = Date.now();
-  const next = await preparePythonEnvironment(root, { cacheRoot });
+  // Import from the real packed installation, not the checkout's runtime.
+  const { preparePythonEnvironment: prepareInstalled } = await import(environmentUrl);
+  const next = await prepareInstalled(root, { cacheRoot });
   assert.equal(next.prepared, true);
   assert.ok(Date.now() - retryAt < 5000, "retry must not wait for a stale lock");
 });
+}
 }
