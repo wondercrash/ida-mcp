@@ -1,6 +1,6 @@
 # Hex-Rays IDA MCP
 
-Official Hex-Rays IDA MCP Server, see the [announcement blog post](https://hex-rays.com/blog/hex-rays-ida-mcp-server) for more information.
+Windows lifecycle fixes for the [official Hex-Rays IDA MCP Server](https://github.com/HexRaysSA/ida-mcp), maintained in [wondercrash/ida-mcp](https://github.com/wondercrash/ida-mcp). See the upstream [announcement](https://hex-rays.com/blog/hex-rays-ida-mcp-server) for background.
 
 ## Installation
 
@@ -77,7 +77,7 @@ copilot plugin update ida-mcp
 
 ```bash
 # Install extension
-pi install git:github.com/HexRaysSA/ida-mcp@latest
+pi install git:github.com/wondercrash/ida-mcp@fix/windows-server-lifecycle
 # Update to latest version
 pi update --extensions
 ```
@@ -86,10 +86,28 @@ pi update --extensions
 
 ```bash
 # Install extension
-omp plugin install github:HexRaysSA/ida-mcp#latest
+omp plugin install github:wondercrash/ida-mcp#fix/windows-server-lifecycle
 # Update to latest version
-omp plugin upgrade
+omp plugin upgrade ida-mcp
 ```
+
+This fork fixes Pi/OMP startup and shutdown on Windows. On first use, the
+extension prepares a cached Python environment outside the installed package.
+Later starts reuse it without running `uv sync`; dependency or version changes
+select a new environment instead of replacing files held by another session.
+Concurrent first starts share preparation. The server runs directly through
+Python, without `uv` or the `ida-mcp.exe` launcher in its runtime process tree.
+
+Environments live under `%LOCALAPPDATA%/ida-mcp/envs` on Windows,
+`~/Library/Caches/ida-mcp/envs` on macOS, and
+`${XDG_CACHE_HOME:-~/.cache}/ida-mcp/envs` on Linux. Old environments are retained
+to avoid disrupting running servers; remove unused environments only after all
+sessions using them have exited.
+
+Shutdown closes stdin rather than forcibly killing the server or its workers,
+allowing Nexus to save databases and release this session's leases without
+disrupting another client. Do not configure a second IDA MCP JSON server for
+the same Pi/OMP extension.
 
 #### Other agents
 

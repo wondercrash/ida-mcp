@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
@@ -18,6 +18,9 @@ import {
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+
+import { preparePythonEnvironment } from "./ida-mcp-environment.ts";
+import { EofStdioClientTransport } from "./ida-mcp-transport.ts";
 
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_VERSION = (
@@ -35,6 +38,9 @@ const STATUS_HIDE_DELAY_MS = 4000;
 const OMP_MCP_STATUS_CHANNEL = "mcp:connection-status";
 const OMP_MCP_SERVER_NAME = "ida";
 const DISCOVERABLE_TOOLS_FLAG = "ida-tools-discoverable";
+// Run the CLI with the cached environment's interpreter directly: no uv or
+// console-script launcher sits between the host and the server.
+const SERVER_ENTRY = "import sys; from ida_mcp.cli import main; sys.exit(main())";
 
 type PiContent =
   | { type: "text"; text: string }
@@ -252,32 +258,31 @@ export default function idaMcp(pi: ExtensionAPI) {
     connectingClient = next;
     let capturedStderr = "";
     let captureStderr = true;
-    const transport = new StdioClientTransport({
-      command: "uv",
-      args: [
-        "run",
-        "--no-dev",
-        "ida-mcp",
-        "stdio",
-        `--agent=${agentKind}`,
-      ],
-      cwd: PACKAGE_ROOT,
-      stderr: "pipe",
-      env: {
-        ...(process.env.IDA_MCP_ID
-          ? { IDA_MCP_ID: process.env.IDA_MCP_ID }
-          : {}),
-        ...(process.env.IDAUSR ? { IDAUSR: process.env.IDAUSR } : {}),
-        ...(process.env.IDA_NEXUS_STATE_DIR
-          ? { IDA_NEXUS_STATE_DIR: process.env.IDA_NEXUS_STATE_DIR }
-          : {}),
-        ...(process.env.IDA_MCP_IDLE_TIMEOUT
-          ? { IDA_MCP_IDLE_TIMEOUT: process.env.IDA_MCP_IDLE_TIMEOUT }
-          : {}),
-      },
+    const transport = new EofStdioClientTransport(async (signal) => {
+      const { python } = await preparePythonEnvironment(PACKAGE_ROOT, {
+        signal,
+      });
+      return {
+        command: python,
+        args: ["-c", SERVER_ENTRY, "stdio", `--agent=${agentKind}`],
+        cwd: PACKAGE_ROOT,
+        env: {
+          ...getDefaultEnvironment(),
+          ...(process.env.IDA_MCP_ID
+            ? { IDA_MCP_ID: process.env.IDA_MCP_ID }
+            : {}),
+          ...(process.env.IDAUSR ? { IDAUSR: process.env.IDAUSR } : {}),
+          ...(process.env.IDA_NEXUS_STATE_DIR
+            ? { IDA_NEXUS_STATE_DIR: process.env.IDA_NEXUS_STATE_DIR }
+            : {}),
+          ...(process.env.IDA_MCP_IDLE_TIMEOUT
+            ? { IDA_MCP_IDLE_TIMEOUT: process.env.IDA_MCP_IDLE_TIMEOUT }
+            : {}),
+        },
+      };
     });
 
-    transport.stderr?.on("data", (chunk: unknown) => {
+    transport.stderr.on("data", (chunk: unknown) => {
       if (!captureStderr) return;
       const text = Buffer.isBuffer(chunk)
         ? chunk.toString("utf8")
@@ -490,19 +495,14 @@ export default function idaMcp(pi: ExtensionAPI) {
 		connectingClient = undefined;
 		startupPromise = undefined;
 		pendingOmpToolRegistration = undefined;
-		// The host caps shutdown handlers at 2s; a stuck MCP pipe must not
-		// outlive the session as an orphaned server process. Bound each close
-		// so a hung transport always settles inside the budget. The timer
-		// resolves on its own — it must NOT call close() again, or a hung
-		// first close would wedge the race on the second close too.
-		const closeSoon = (c: Client): Promise<void> =>
-			// setTimeout executor (not withResolvers): the repo typechecks at ES2022.
-			Promise.race([c.close(), new Promise<void>(resolve => setTimeout(resolve, 1500))]).catch(
-				() => undefined,
-			);
-		await Promise.all([
-			active ? closeSoon(active) : undefined,
-			connecting && connecting !== active ? closeSoon(connecting) : undefined,
-		]);
+		// Closing only ends the server's stdin and returns within the transport's
+		// grace period, inside the host's 2s shutdown budget. The server saves
+		// and exits on its own; it is never killed. Closing a client still
+		// preparing its environment aborts the launch.
+		await Promise.all(
+			[active, connecting !== active ? connecting : undefined].map(c =>
+				c?.close().catch(() => undefined),
+			),
+		);
 	});
 }
