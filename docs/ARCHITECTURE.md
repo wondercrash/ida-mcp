@@ -60,6 +60,16 @@ Stdio EOF, SIGINT, SIGTERM, normal interpreter exit, and explicit HTTP shutdown
 release the process's handles. Nexus performs final managed-worker save and
 shutdown when the last lease disappears.
 
+After stdio EOF database cleanup completes, a daemon watcher probes event-loop
+responsiveness. Healthy loops may finish long-running calls without a teardown
+deadline. A probe unanswered for ten seconds exits only the MCP server, never
+Nexus workers; periodic probes detect a stranded loop within ten to twenty
+seconds, excluding any wait for a trace write. Normal loop teardown cancels and
+joins the watcher. It is not armed while leases are being released or if release
+raises. A trace-stop error after successful release does not prevent arming.
+Forced exit waits for the trace lock so written JSONL records remain complete;
+a genuinely stranded loop can still lose future tool results.
+
 ## Semantic tracing
 
 One schema-1 JSONL trace is created lazily on the first tool call. Lifecycle-only

@@ -90,6 +90,9 @@ from zeromcp import McpServer, McpToolError
 SESSIONS_DIR = get_mcp_state_dir() / "sessions"
 OPEN_TIMEOUT_SECONDS = 300
 EXECUTE_TIMEOUT_SECONDS = 360
+# After stdio EOF cleanup, a server whose event loop leaves a liveness probe
+# unanswered this long exits the process; see ``_EOFExitSafeguard``.
+EOF_EXIT_GRACE_SECONDS = 10.0
 
 
 def _mcp_idle_timeout_from_environment() -> float | None:
@@ -391,14 +394,18 @@ def _start_mcp_trace(transport: str, agent: str | None) -> None:
     )
 
 
-def _shutdown_server_state() -> None:
+def _stop_mcp_trace() -> None:
     global _TRACE_STOPPED
-    DATABASE_MANAGER.shutdown()
     with _TRACE_LIFECYCLE_LOCK:
         if not _TRACE_STARTED or _TRACE_STOPPED:
             return
         _TRACE_STOPPED = True
     TRACE.emit("mcp_stopped", session=_session_fields())
+
+
+def _shutdown_server_state() -> None:
+    DATABASE_MANAGER.shutdown()
+    _stop_mcp_trace()
 
 
 atexit.register(_shutdown_server_state)
@@ -982,6 +989,83 @@ class _ShutdownOnEOFInput:
         return getattr(self._stream, name)
 
 
+class _EOFExitSafeguard:
+    """Exit a stdio server whose event loop stops responding after EOF cleanup.
+
+    On Windows the Proactor loop can miss a thread-safe wakeup, leaving
+    ``asyncio.run`` blocked although every lease is released and the trace is
+    stopped. Once armed, a watcher posts liveness probes to the loop. A loop
+    that answers keeps the server alive, so in-flight tool calls still deliver
+    their replies and trace records however long they run; one that leaves a
+    probe unanswered for ``grace`` seconds ends the process. Probes repeat
+    after each answer because a wakeup can be lost after an earlier probe was
+    answered, so a stranded loop exits between one and two graces after
+    stranding. Nexus workers run in their own process groups and outlive the
+    exit. ``cancel`` stops the watcher once the loop has finished.
+    """
+
+    def __init__(self, grace: float) -> None:
+        self._grace = grace
+        self._condition = threading.Condition()
+        self._cancelled = False
+        self._answered = False
+        self._thread: threading.Thread | None = None
+
+    def arm(self, loop: asyncio.AbstractEventLoop) -> None:
+        with self._condition:
+            if self._cancelled or self._thread is not None:
+                return
+            self._thread = threading.Thread(
+                target=self._watch,
+                args=(loop,),
+                name="ida-mcp-eof-exit",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def cancel(self) -> None:
+        with self._condition:
+            self._cancelled = True
+            self._condition.notify_all()
+            thread = self._thread
+        if thread is not None:
+            thread.join()
+
+    def _answer(self) -> None:
+        with self._condition:
+            self._answered = True
+            self._condition.notify_all()
+
+    def _watch(self, loop: asyncio.AbstractEventLoop) -> None:
+        while True:
+            # Each probe is answered before the next is posted, so a single
+            # flag cannot see a stale answer.
+            with self._condition:
+                self._answered = False
+            try:
+                loop.call_soon_threadsafe(self._answer)
+            except RuntimeError:
+                return  # The loop is closed, so serve_stdio is returning.
+            with self._condition:
+                answered = self._condition.wait_for(
+                    lambda: self._cancelled or self._answered, self._grace
+                )
+                if answered:
+                    if self._condition.wait_for(lambda: self._cancelled, self._grace):
+                        return
+                    continue
+            # TRACE._lock covers each record append, so exit cannot truncate
+            # a JSONL line. Never wait for it with the condition held: the
+            # loop can answer or cancel while a trace append finishes.
+            with TRACE._lock, self._condition:
+                if self._cancelled or loop.is_closed():
+                    return
+                if not self._answered:
+                    os._exit(0)
+            # A late answer arrived during the trace-lock wait. Resume probes
+            # instead of exiting a recovered loop.
+
+
 def serve_stdio(
     *,
     database: str | None = None,
@@ -1014,15 +1098,34 @@ def serve_stdio(
     if database:
         DATABASE_MANAGER.schedule_startup_open(database)
 
-    # ZeroMCP only reads from this transparent proxy, but its public annotation
-    # requires the concrete BinaryIO type.
-    stdin = cast(
-        BinaryIO,
-        _ShutdownOnEOFInput(sys.stdin.buffer, _shutdown_server_state),
-    )
+    exit_safeguard = _EOFExitSafeguard(EOF_EXIT_GRACE_SECONDS)
     try:
-        asyncio.run(mcp.stdio_async(stdin=stdin))
+        # Runner is asyncio.run with the loop exposed to the EOF thread. The
+        # safeguard is cancelled only after the runner has closed the loop, so
+        # a strand during executor shutdown is covered as well.
+        with asyncio.Runner() as runner:
+            loop = runner.get_loop()
+
+            def shutdown_on_eof() -> None:
+                # A lease release error leaves lease state unknown, so it
+                # propagates without arming. A trace-stop error comes after
+                # every lease is released; the safeguard is still armed once
+                # that step has finished, and the error then propagates.
+                DATABASE_MANAGER.shutdown()
+                try:
+                    _stop_mcp_trace()
+                finally:
+                    exit_safeguard.arm(loop)
+
+            # ZeroMCP only reads from this transparent proxy, but its public
+            # annotation requires the concrete BinaryIO type.
+            stdin = cast(
+                BinaryIO,
+                _ShutdownOnEOFInput(sys.stdin.buffer, shutdown_on_eof),
+            )
+            runner.run(mcp.stdio_async(stdin=stdin))
     finally:
+        exit_safeguard.cancel()
         _shutdown_server_state()
 
 
